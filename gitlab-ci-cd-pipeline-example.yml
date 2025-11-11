@@ -1,0 +1,313 @@
+variables:
+  GIT_SUBMODULE_STRATEGY: recursive 
+  PUSH_IMAGE: "true"
+  BUILD_ARGS: "kafka sqlite"
+  SCAN_IMAGE: "false"
+  EXTRA_TAGS: "${CI_COMMIT_TAG}"
+  CONTEXT_DIR_ETL: "k8s-infra/Docker_image_files/etl"
+  REGISTRY_IMAGE_PATH_ETL: "${CI_REGISTRY}/wp3/t3.5/self-security/etl"
+  CONTEXT_DIR_SURICATA: "k8s-infra/Docker_image_files/suricata"
+  REGISTRY_IMAGE_PATH_SURICATA: "${CI_REGISTRY}/wp3/t3.5/self-security/self-security"
+  DOCKER_FILE_NAME: "Dockerfile"
+  DOCKER_HOST: "tcp://docker:2375"
+  DOCKER_TLS_CERTDIR: ""
+
+stages:
+  - secret_scanning
+  - sast
+  - sca - build_image - scan_image - deploy - dast
+
+gitleaks:
+  stage: secret_scanning
+  image:
+    name: zricethezav/gitleaks
+    entrypoint: [""]
+  script:
+    - gitleaks detect --verbose --source . -f json -r detect_gitleaks.json
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - detect_gitleaks.json
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  
+gitleaks_protect:
+  stage: secret_scanning
+  image: 
+    name: zricethezav/gitleaks
+    entrypoint: [""]
+  script: 
+    - gitleaks protect --verbose --source . -f json -r protect_gitleaks.json
+  allow_failure: true
+  artifacts:
+    when: always 
+    paths: 
+      - protect_gitleaks.json 
+  dependencies: 
+    - gitleaks
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+njsscan:
+  stage: sast
+  needs: ["gitleaks_protect"]
+  image: python
+  before_script: 
+    - pip3 install --upgrade njsscan
+  script: 
+    - njsscan --exit-warning . --sarif -o njsscan.sarif
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - njsscan.sarif
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+semgrep:
+  stage: sast
+  needs: ["gitleaks_protect"]
+  image: returntocorp/semgrep
+  variables:
+    SEMGREP_RULES: p/javascript
+  script: 
+    - semgrep ci --json --output semgrep.json
+  allow_failure: true
+  artifacts:
+    when: always
+    paths:
+      - semgrep.json
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+sonarqube-check:
+  stage: sast
+  needs: ["gitleaks_protect"]
+  image: 
+    name: sonarsource/sonar-scanner-cli:5.0
+    entrypoint: [""]
+  variables: 
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"
+    GIT_DEPTH: "0"
+  cache: 
+    key: "${CI_JOB_NAME}"
+    paths: 
+      - .sonar/cache
+  script:
+     - sonar-scanner
+  allow_failure: true
+  rules: 
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+sonarqube-vulnerability-report:
+  stage: sast 
+  script:
+    - apt-get update && apt-get install -y curl- 'curl -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/gitlab_sast_export?projectKey=selft-security&branch=${CI_COMMIT_BRANCH}&pullRequest=${CI_MERGE_REQUEST_IID}" -o gl-sast-sonar-report.json'
+  allow_failure: true
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+  artifacts:
+    expire_in: 1 day
+    reports:
+      sast: gl-sast-sonar-report.json
+  dependencies:
+    - sonarqube-check
+
+retire:
+  stage: sca
+  needs: ["gitleaks_protect"]
+  script:
+    - echo "SCA ..."
+
+build_image_self-security:
+  stage: build_image
+  needs: ["njsscan","semgrep","sonarqube-vulnerability-report","retire"]
+  image: 
+    name: gcr.io/kaniko-project/executor:v1.14.0-debug
+    entrypoint: [""]
+  script:
+    - |
+      if [[ -z "${REGISTRY_USER}" || -z "${REGISTRY_PASSWORD}" ]]; then
+        REGISTRY_USER=${CI_REGISTRY_USER}
+        REGISTRY_PASSWORD=${CI_REGISTRY_PASSWORD
+         unset CI_REGISTRY_USER; unset CI_REGISTRY_PASSWORD;
+      fi
+    - | 
+      if [ -z "${REGISTRY_IMAGE_PATH_SURICATA}" ]; then
+        echo "ERROR: CI variable REGISTRY_IMAGE_PATH_SURICATA is mandatory."
+        exit 1
+      fi
+    - REGISTRY=$(echo ${REGISTRY_IMAGE_PATH_SURICATA} | cut -d / -f 1)
+    - |
+      KANIKO_CONTEXT_DIR_SURICATA=${CI_PROJECT_DIR}/${CONTEXT_DIR_SURICATA}
+    - mkdir -p /kaniko/.docker
+    - |
+      echo "{\"auths\":{\"${REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${REGISTRY_USER}" "${REGISTRY_PASSWORD}" | base64 -w0)\"}}}" > /kaniko/.docker/config.json
+    - |
+      if [ "$(echo ${PUSH_IMAGE} | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+        PUSH_IMAGE="" else echo "Info: defer pushing image to remote as PUSH_IMAGE is false" PUSH_IMAGE="--no-push" fi
+    - | 
+      if [ -n "$EXTRA_TAGS" ]; then
+        IMAGE_WITHOUT_TAG=$(echo ${REGISTRY_IMAGE_PATH_SURICATA} | cut -d : -f 1)
+        for tag in $EXTRA_TAGS; do
+          KANIKO_EXTRA_TAGS="${KANIKO_EXTRA_TAGS} --destination ${IMAGE_WITHOUT_TAG}:${tag}"
+        done
+      fi
+    - /kaniko/executor
+      --context "${KANIKO_CONTEXT_DIR_SURICATA}"
+      --dockerfile "${KANIKO_CONTEXT_DIR_SURICATA}/${DOCKER_FILE_NAME}"
+      --build-arg optional_dependencies="${BUILD_ARGS}"
+      --destination "${REGISTRY_IMAGE_PATH_SURICATA}" ${KANIKO_EXTRA_TAGS} ${PUSH_IMAGE}
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+build_image_etl:
+  stage: build_image
+  needs: ["njsscan","semgrep","sonarqube-vulnerability-report","retire"]
+  image:
+    name: gcr.io/kaniko-project/executor:v1.14.0-debug
+    entrypoint: [""]
+  script:
+    - | 
+      if [[ -z "${REGISTRY_USER}" || -z "${REGISTRY_PASSWORD}" ]]; then
+        REGISTRY_USER=${CI_REGISTRY_USER}
+        REGISTRY_PASSWORD=${CI_REGISTRY_PASSWORD}
+        unset CI_REGISTRY_USER; unset CI_REGISTRY_PASSWORD;
+      fi
+    - |
+      if [ -z "${REGISTRY_IMAGE_PATH_ETL}" ]; then
+        echo "ERROR: CI variable REGISTRY_IMAGE_PATH_ETL is mandatory."
+        exit 1
+      fi
+    - REGISTRY=$(echo ${REGISTRY_IMAGE_PATH_ETL} | cut -d / -f 1)
+    - |
+      KANIKO_CONTEXT_DIR_ETL=${CI_PROJECT_DIR}/${CONTEXT_DIR_ETL}
+    - mkdir -p /kaniko/.docker
+    - |
+      echo "{\"auths\":{\"${REGISTRY}\":{\"auth\":\"$(printf "%s:%s" "${REGISTRY_USER}" "${REGISTRY_PASSWORD}" | base64 -w0)\"}}}" > /kaniko/.docker/config.json
+    - |
+      if [ "$(echo ${PUSH_IMAGE} | tr '[:upper:]' '[:lower:]')" = "true" ]; then
+        PUSH_IMAGE=""
+      else
+        echo "Info: defer pushing image to remote as PUSH_IMAGE is false"
+        PUSH_IMAGE="--no-push"
+      fi
+    - |
+      if [ -n "$EXTRA_TAGS" ]; then
+        IMAGE_WITHOUT_TAG=$(echo ${REGISTRY_IMAGE_PATH_ETL} | cut -d : -f 1)
+        for tag in $EXTRA_TAGS; do
+          KANIKO_EXTRA_TAGS="${KANIKO_EXTRA_TAGS} --destination ${IMAGE_WITHOUT_TAG}:${tag}"
+        done
+      fi
+    - /kaniko/executor
+      --context "${KANIKO_CONTEXT_DIR_ETL}"
+      --dockerfile "${KANIKO_CONTEXT_DIR_ETL}/${DOCKER_FILE_NAME}"
+      --build-arg optional_dependencies="${BUILD_ARGS}"
+      --destination "${REGISTRY_IMAGE_PATH_ETL}" ${KANIKO_EXTRA_TAGS} ${PUSH_IMAGE}
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+scan_image_self-security:
+  stage: scan_image
+  needs: ["build_image_self-security"]
+  image: docker:24
+  services: 
+    - name: docker:24-dind
+      alias: docker
+  before_script:
+    - apk --no-cache add curl python3 py3-pip
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  script: 
+    - docker pull "${REGISTRY_IMAGE_PATH_SURICATA}:latest"
+    - trivy image --exit-code 1 "${REGISTRY_IMAGE_PATH_SURICATA}:latest"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+scan_image_etl:
+  stage: scan_image
+  needs: ["build_image_etl"]
+  image: docker:24
+  services:
+  - name: docker:24-dind
+    alias: docker
+  before_script:
+    - apk --no-cache add curl python3 py3-pip
+    - curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+    - echo $CI_REGISTRY_PASSWORD | docker login -u $CI_REGISTRY_USER --password-stdin $CI_REGISTRY
+  script:
+    - docker pull "${REGISTRY_IMAGE_PATH_ETL}:latest"
+    - trivy image --exit-code 1 "${REGISTRY_IMAGE_PATH_ETL}:latest"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+deploy_self-security:
+  stage: deploy
+  needs: ["build_image_self-security", "scan_image_self-security"]
+  script:
+    - echo "Deploy self-Security ..."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+deploy_etl:
+  stage: deploy
+  needs: ["build_image_etl", "scan_image_etl"]
+  script:
+    - echo "Deploy ETL ..."
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+zap_baseline_etl:
+  stage: dast
+  needs: ["deploy_etl"]
+  image: ghcr.io/zaproxy/zaproxy:stable
+  script:
+    - echo "zap"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+zap_full_etl:
+  stage: dast
+  needs: ["deploy_etl"]
+  image: ghcr.io/zaproxy/zaproxy:stable
+  script:
+    - echo "zap"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+zap_baseline_self-security:
+  stage: dast
+  needs: ["deploy_self-security"]
+  image: ghcr.io/zaproxy/zaproxy:stable
+  variables:
+    ZAP_TARGET: "http://URL:PORT/"
+  before_script:
+    - mkdir -p /zap/wrk
+  script:
+    - zap-baseline.py -t $ZAP_TARGET -g gen.conf -I -x baseline.xml
+    - cp /zap/wrk/baseline.xml baseline.xml
+  artifacts:
+    when: always
+    paths:
+      - baseline.xml
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
+
+zap_full_self-security:
+  stage: dast
+  needs: ["deploy_self-security"]
+  image: ghcr.io/zaproxy/zaproxy:stable
+  variables:
+    ZAP_TARGET: "http://URL:PORT/"
+  before_script:
+    - mkdir -p /zap/wrk
+  script:
+    - zap-full-scan.py -t $ZAP_TARGET -g gen.conf -I -x full-zap.xml
+    - cp /zap/wrk/full-zap.xml full-zap.xml
+  artifacts:
+    when: always
+    paths:
+      - full-zap.xml
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "develop"'
